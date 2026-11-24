@@ -5,6 +5,7 @@
  * обычного видеоисточника. Переключение камер сохраняет позицию на таймлайне.
  */
 #include "mc-common.h"
+#include "mc-api.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -62,7 +63,12 @@ struct mc_replay {
 	struct mc_hk_ctx hk[HK_MAX];
 	obs_hotkey_id hk_ids[HK_MAX];
 	size_t hk_count;
+
+	struct mc_replay *next_reg; /* реестр экземпляров для окна управления */
 };
+
+static pthread_mutex_t g_reg_mutex;
+static struct mc_replay *g_reg;
 
 /* ---------- вспомогательное (mutex уже взят) ---------- */
 
@@ -471,12 +477,26 @@ static void *mc_replay_create(obs_data_t *settings, obs_source_t *source)
 		r->hk_ids[i] = obs_hotkey_register_source(source, hk_defs[i].name, T(hk_defs[i].text), hotkey_cb, &r->hk[i]);
 		r->hk_count++;
 	}
+
+	pthread_mutex_lock(&g_reg_mutex);
+	r->next_reg = g_reg;
+	g_reg = r;
+	pthread_mutex_unlock(&g_reg_mutex);
 	return r;
 }
 
 static void mc_replay_destroy(void *data)
 {
 	struct mc_replay *r = data;
+
+	pthread_mutex_lock(&g_reg_mutex);
+	for (struct mc_replay **pp = &g_reg; *pp; pp = &(*pp)->next_reg) {
+		if (*pp == r) {
+			*pp = r->next_reg;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_reg_mutex);
 
 	for (size_t i = 0; i < r->hk_count; i++)
 		obs_hotkey_unregister(r->hk_ids[i]);
@@ -629,3 +649,100 @@ struct obs_source_info mc_replay_source_info = {
 	.get_properties = mc_replay_properties,
 	.video_tick = mc_replay_tick,
 };
+
+/* ---------- API для окна управления (mc-control.cpp) ---------- */
+
+void mc_replay_registry_init(void)
+{
+	pthread_mutex_init(&g_reg_mutex, NULL);
+	g_reg = NULL;
+}
+
+void mc_replay_registry_shutdown(void)
+{
+	pthread_mutex_destroy(&g_reg_mutex);
+}
+
+static struct mc_replay *reg_find(const char *name)
+{
+	for (struct mc_replay *r = g_reg; r; r = r->next_reg) {
+		const char *n = obs_source_get_name(r->source);
+		if (n && name && strcmp(n, name) == 0)
+			return r;
+	}
+	return NULL;
+}
+
+void mc_replay_enum_names(mc_name_cb cb, void *param)
+{
+	pthread_mutex_lock(&g_reg_mutex);
+	for (struct mc_replay *r = g_reg; r; r = r->next_reg) {
+		const char *n = obs_source_get_name(r->source);
+		if (n)
+			cb(n, param);
+	}
+	pthread_mutex_unlock(&g_reg_mutex);
+}
+
+bool mc_replay_trigger(const char *source_name, const char *action)
+{
+	bool ok = false;
+	pthread_mutex_lock(&g_reg_mutex);
+	struct mc_replay *r = reg_find(source_name);
+	if (r) {
+		for (size_t i = 0; i < HK_COUNT; i++) {
+			if (strcmp(hk_defs[i].name, action) == 0) {
+				hk_defs[i].fn(r, hk_defs[i].arg);
+				ok = true;
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&g_reg_mutex);
+	return ok;
+}
+
+bool mc_replay_set_speed(const char *source_name, double percent)
+{
+	bool ok = false;
+	pthread_mutex_lock(&g_reg_mutex);
+	struct mc_replay *r = reg_find(source_name);
+	if (r) {
+		pthread_mutex_lock(&r->mutex);
+		if (percent < 5.0)
+			percent = 5.0;
+		if (percent > 400.0)
+			percent = 400.0;
+		r->speed = percent;
+		set_setting_double(r, S_SPEED, percent);
+		pthread_mutex_unlock(&r->mutex);
+		ok = true;
+	}
+	pthread_mutex_unlock(&g_reg_mutex);
+	return ok;
+}
+
+bool mc_replay_get_status(const char *source_name, struct mc_replay_status *out)
+{
+	bool ok = false;
+	pthread_mutex_lock(&g_reg_mutex);
+	struct mc_replay *r = reg_find(source_name);
+	if (r) {
+		pthread_mutex_lock(&r->mutex);
+		out->clips = (int)r->nclips;
+		out->cur = r->nclips ? (int)r->cur + 1 : 0;
+		out->cam = r->cam + 1;
+		out->speed = r->speed;
+		out->playing = r->playing;
+		out->backward = r->backward;
+		out->hidden = r->hidden;
+		out->post_pending = r->pending_at != 0;
+		out->pos_sec = r->nclips ? (double)r->pos / 1e9 : 0.0;
+		out->dur_sec = r->nclips ? (double)clip_duration(&r->clips[r->cur]) / 1e9 : 0.0;
+		out->mem_mb = (double)mc_mem_in_use() / (1024.0 * 1024.0);
+		pthread_mutex_unlock(&r->mutex);
+		ok = true;
+	}
+	pthread_mutex_unlock(&g_reg_mutex);
+	return ok;
+}
