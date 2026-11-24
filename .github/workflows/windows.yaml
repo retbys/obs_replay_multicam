@@ -1,0 +1,26 @@
+name: Build Windows
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake --preset windows-x64
+
+      - name: Build
+        run: cmake --build --preset windows-x64 --config RelWithDebInfo --parallel
+
+      - name: Install
+        run: cmake --install build_x64 --config RelWithDebInfo --prefix "${{ github.workspace }}/release"
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: obs-multicam-replay-windows-x64
+          path: release/*
