@@ -10,6 +10,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check project files
+        shell: bash
+        run: |
+          ls -la
+          test -f CMakePresets.json
+          test -d cmake
+          test -f src/mc-replay-source.c
+
       - name: Configure
         run: cmake --preset windows-x64
 
@@ -19,8 +27,13 @@ jobs:
       - name: Install
         run: cmake --install build_x64 --config RelWithDebInfo --prefix "${{ github.workspace }}/release"
 
+      - name: Show result
+        shell: bash
+        run: find release -type f
+
       - name: Upload plugin
         uses: actions/upload-artifact@v4
         with:
           name: obs-multicam-replay-windows-x64
-          path: release/*
+          path: release
+          if-no-files-found: error
