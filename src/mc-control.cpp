@@ -41,7 +41,7 @@ public:
 	explicit MCControl(QWidget *parent) : QWidget(parent, Qt::Window)
 	{
 		setWindowTitle(T("ControlTitle"));
-		resize(520, 480);
+		resize(540, 760);
 
 		QVBoxLayout *root = new QVBoxLayout(this);
 
@@ -118,6 +118,54 @@ public:
 		sp->addWidget(speedLbl);
 		root->addWidget(spBox);
 
+		/* камеры подряд */
+		QGroupBox *seqBox = new QGroupBox(T("ControlSequence"), this);
+		QVBoxLayout *seqCol = new QVBoxLayout(seqBox);
+		QHBoxLayout *seqRow = new QHBoxLayout();
+		for (int i = 0; i < 4; i++) {
+			seqCam[i] = new QCheckBox(T("ControlCamShort") + " " + QString::number(i + 1), this);
+			seqCam[i]->setChecked(true);
+			const QString key = QString("seq_cam%1").arg(i + 1);
+			connect(seqCam[i], &QCheckBox::toggled, this,
+				[this, key](bool on) { applyBool(key.toUtf8().constData(), on); });
+			seqRow->addWidget(seqCam[i]);
+		}
+		QPushButton *seqPlay = new QPushButton(T("ControlSeqPlay"), this);
+		seqPlay->setMinimumHeight(40);
+		seqPlay->setStyleSheet("QPushButton{background:#1565c0;color:white;font-weight:bold;font-size:15px;}"
+				       "QPushButton:pressed{background:#0d47a1;}");
+		connect(seqPlay, &QPushButton::clicked, this, [this]() { trig("mc_seq_play"); });
+		autoSeq = new QCheckBox(T("ControlAutoSeq"), this);
+		connect(autoSeq, &QCheckBox::toggled, this, [this](bool on) { applyBool("autoplay_seq", on); });
+		seqCol->addLayout(seqRow);
+		seqCol->addWidget(seqPlay);
+		seqCol->addWidget(autoSeq);
+		root->addWidget(seqBox);
+
+		/* возврат на сцену */
+		QGroupBox *retBox = new QGroupBox(T("ControlReturn"), this);
+		QGridLayout *rg = new QGridLayout(retBox);
+		retEnable = new QCheckBox(T("ControlReturnEnable"), this);
+		connect(retEnable, &QCheckBox::toggled, this, [this](bool on) { applyBool("return_enabled", on); });
+		retScene = new QComboBox(this);
+		retScene->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+		connect(retScene, &QComboBox::currentTextChanged, this, [this](const QString &t) {
+			if (!updating)
+				applyString("return_scene", t.toUtf8().constData());
+		});
+		retDelay = new QSpinBox(this);
+		retDelay->setRange(0, 60000);
+		retDelay->setSingleStep(100);
+		retDelay->setSuffix(" " + T("ControlMsShort"));
+		connect(retDelay, QOverload<int>::of(&QSpinBox::valueChanged), this,
+			[this](int v) { applySetting("return_delay_ms", v); });
+		rg->addWidget(retEnable, 0, 0, 1, 2);
+		rg->addWidget(new QLabel(T("ControlReturnScene"), this), 1, 0);
+		rg->addWidget(retScene, 1, 1);
+		rg->addWidget(new QLabel(T("ControlReturnDelay"), this), 2, 0);
+		rg->addWidget(retDelay, 2, 1);
+		root->addWidget(retBox);
+
 		/* параметры клипа */
 		QHBoxLayout *prm = new QHBoxLayout();
 		prm->addWidget(new QLabel(T("ControlClipLen"), this));
@@ -174,6 +222,14 @@ private:
 	QSpinBox *clipSec = nullptr;
 	QSpinBox *postMs = nullptr;
 	QCheckBox *onTop = nullptr;
+	QCheckBox *seqCam[4] = {nullptr, nullptr, nullptr, nullptr};
+	QCheckBox *autoSeq = nullptr;
+	QCheckBox *retEnable = nullptr;
+	QComboBox *retScene = nullptr;
+	QSpinBox *retDelay = nullptr;
+	QStringList sceneNames;
+	QString savedScene;
+	int sceneTick = 0;
 	QTimer *timer = nullptr;
 	QStringList names;
 	bool updating = false;
@@ -222,6 +278,66 @@ private:
 		obs_source_release(s);
 	}
 
+	void applyBool(const char *key, bool value)
+	{
+		if (updating)
+			return;
+		const QByteArray n = srcName();
+		if (n.isEmpty())
+			return;
+		obs_source_t *s = obs_get_source_by_name(n.constData());
+		if (!s)
+			return;
+		obs_data_t *d = obs_source_get_settings(s);
+		obs_data_set_bool(d, key, value);
+		obs_source_update(s, d);
+		obs_data_release(d);
+		obs_source_release(s);
+	}
+
+	void applyString(const char *key, const char *value)
+	{
+		if (updating)
+			return;
+		const QByteArray n = srcName();
+		if (n.isEmpty())
+			return;
+		obs_source_t *s = obs_get_source_by_name(n.constData());
+		if (!s)
+			return;
+		obs_data_t *d = obs_source_get_settings(s);
+		obs_data_set_string(d, key, value);
+		obs_source_update(s, d);
+		obs_data_release(d);
+		obs_source_release(s);
+		savedScene = QString::fromUtf8(value);
+	}
+
+	/* список сцен OBS; выбранная сцена берётся из настроек источника */
+	void fillScenes(bool force)
+	{
+		QStringList now;
+		char **list = obs_frontend_get_scene_names();
+		for (char **p = list; p && *p; p++)
+			now.append(QString::fromUtf8(*p));
+		bfree(list);
+
+		if (!force && now == sceneNames)
+			return;
+		sceneNames = now;
+		updating = true;
+		retScene->clear();
+		retScene->addItem(QString());
+		retScene->addItems(sceneNames);
+		int i = retScene->findText(savedScene);
+		if (i < 0 && !savedScene.isEmpty()) {
+			retScene->addItem(savedScene); /* сцены уже нет, но выбор не теряем */
+			i = retScene->count() - 1;
+		}
+		retScene->setCurrentIndex(i < 0 ? 0 : i);
+		updating = false;
+	}
+
 	void loadSettings()
 	{
 		const QByteArray n = srcName();
@@ -234,9 +350,16 @@ private:
 		updating = true;
 		clipSec->setValue((int)obs_data_get_int(d, "clip_seconds"));
 		postMs->setValue((int)obs_data_get_int(d, "post_ms"));
+		for (int i = 0; i < 4; i++)
+			seqCam[i]->setChecked(obs_data_get_bool(d, QString("seq_cam%1").arg(i + 1).toUtf8().constData()));
+		autoSeq->setChecked(obs_data_get_bool(d, "autoplay_seq"));
+		retEnable->setChecked(obs_data_get_bool(d, "return_enabled"));
+		retDelay->setValue((int)obs_data_get_int(d, "return_delay_ms"));
+		savedScene = QString::fromUtf8(obs_data_get_string(d, "return_scene"));
 		updating = false;
 		obs_data_release(d);
 		obs_source_release(s);
+		fillScenes(true);
 	}
 
 	void refresh()
@@ -255,6 +378,11 @@ private:
 				src->setCurrentIndex(i);
 			updating = false;
 			loadSettings();
+		}
+
+		if (++sceneTick >= 10) {
+			sceneTick = 0;
+			fillScenes(false);
 		}
 
 		const QByteArray n = srcName();
@@ -280,10 +408,14 @@ private:
 			state = T("StatePost");
 		else if (st.hidden)
 			state = T("StateHidden");
+		else if (st.seq)
+			state = T("StateSeqFmt").arg(st.seq_pos).arg(st.seq_total);
 		else if (st.playing)
 			state = st.backward ? T("StateBackward") : T("StatePlaying");
 		else
 			state = T("StatePaused");
+		if (st.return_pending)
+			state += " " + T("StateReturn");
 
 		status->setText(T("StatusFmt")
 					.arg(st.cur)

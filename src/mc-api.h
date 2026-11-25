@@ -17,6 +17,10 @@ struct mc_replay_status {
 	bool backward;
 	bool hidden;
 	bool post_pending; /* идёт пост-ролл, клип ещё не сохранён */
+	bool seq;          /* идёт проигрывание камер подряд */
+	int seq_pos;       /* какая по счёту камера в последовательности */
+	int seq_total;     /* сколько камер в последовательности */
+	bool return_pending; /* ждём возврата на сцену */
 	double pos_sec;
 	double dur_sec;
 	double mem_mb; /* память, занятая кадрами всех камер */

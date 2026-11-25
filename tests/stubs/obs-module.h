@@ -53,7 +53,7 @@ enum obs_source_type { OBS_SOURCE_TYPE_INPUT, OBS_SOURCE_TYPE_FILTER };
 #define OBS_SOURCE_ASYNC_VIDEO 1
 enum { OBS_TEXT_DEFAULT, OBS_TEXT_INFO };
 enum { OBS_COMBO_TYPE_LIST };
-enum { OBS_COMBO_FORMAT_INT };
+enum { OBS_COMBO_FORMAT_INT, OBS_COMBO_FORMAT_STRING };
 
 struct obs_source_info {
 	const char *id;
@@ -109,6 +109,14 @@ obs_property_t *obs_properties_add_int(obs_properties_t *, const char *, const c
 obs_property_t *obs_properties_add_float_slider(obs_properties_t *, const char *, const char *, double, double, double);
 obs_property_t *obs_properties_add_bool(obs_properties_t *, const char *, const char *);
 obs_property_t *obs_properties_add_button2(obs_properties_t *, const char *, const char *, obs_property_clicked_t, void *);
+size_t obs_property_list_add_string(obs_property_t *, const char *, const char *);
+void obs_data_set_bool(obs_data_t *, const char *, bool);
+void obs_data_set_string(obs_data_t *, const char *, const char *);
+obs_source_t *obs_get_source_by_name(const char *);
+void obs_source_release(obs_source_t *);
+enum obs_task_type { OBS_TASK_UI, OBS_TASK_GRAPHICS };
+typedef void (*obs_task_t)(void *);
+void obs_queue_task(enum obs_task_type, obs_task_t, void *, bool);
 void obs_property_int_set_suffix(obs_property_t *, const char *);
 void obs_property_float_set_suffix(obs_property_t *, const char *);
 

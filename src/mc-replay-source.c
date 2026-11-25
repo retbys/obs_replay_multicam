@@ -6,6 +6,7 @@
  */
 #include "mc-common.h"
 #include "mc-api.h"
+#include <obs-frontend-api.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -20,6 +21,10 @@
 #define S_MAX_CLIPS "max_clips"
 #define S_MEM_MB "mem_mb"
 #define S_AUTOPLAY "autoplay"
+#define S_AUTOSEQ "autoplay_seq"
+#define S_RET_EN "return_enabled"
+#define S_RET_SCENE "return_scene"
+#define S_RET_DELAY "return_delay_ms"
 
 enum { END_HOLD = 0, END_LOOP = 1, END_HIDE = 2 };
 
@@ -48,6 +53,11 @@ struct mc_replay {
 	int max_clips;
 	size_t mem_limit;
 	bool autoplay;
+	bool autoseq;                  /* после Save играть все камеры подряд */
+	bool seq_cam[MC_MAX_CAMS];     /* какие камеры входят в последовательность */
+	bool return_enabled;           /* после повтора вернуться на сцену */
+	char *return_scene;
+	int return_delay_ms;
 
 	/* клипы, старые первыми */
 	struct mc_clip *clips;
@@ -56,6 +66,8 @@ struct mc_replay {
 
 	/* состояние воспроизведения */
 	bool playing, backward, hidden, shown, need_output;
+	bool seq_active;     /* идёт проигрывание камер подряд */
+	uint64_t return_at;  /* когда переключать сцену (0 = не нужно) */
 	int64_t pos; /* смещение от clips[cur].t0, нс */
 	uint64_t pending_at;
 	struct mc_frame *last_out;
@@ -111,6 +123,43 @@ static void start_play(struct mc_replay *r)
 	r->playing = true;
 	r->hidden = false;
 	r->need_output = true;
+	r->seq_active = false;
+	r->return_at = 0;
+}
+
+static void set_setting_int(struct mc_replay *r, const char *key, long long v);
+
+/* Камеры подряд: клип остаётся тем же, меняется только камера. Камеры без кадров
+ * в клипе пропускаются. Нужен захваченный mutex. */
+static bool seq_start(struct mc_replay *r)
+{
+	if (!r->nclips)
+		return false;
+	r->cur = r->nclips - 1;
+	const struct mc_clip *c = &r->clips[r->cur];
+	for (int i = 0; i < MC_MAX_CAMS; i++) {
+		if (r->seq_cam[i] && c->count[i]) {
+			r->cam = i;
+			r->last_out = NULL;
+			set_setting_int(r, S_CAMERA, i + 1);
+			start_play(r);
+			r->seq_active = true;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool seq_next(struct mc_replay *r)
+{
+	const struct mc_clip *c = &r->clips[r->cur];
+	for (int i = r->cam + 1; i < MC_MAX_CAMS; i++) {
+		if (r->seq_cam[i] && c->count[i]) {
+			r->cam = i;
+			return true;
+		}
+	}
+	return false;
 }
 
 static void do_snapshot(struct mc_replay *r, uint64_t t_end)
@@ -140,9 +189,13 @@ static void do_snapshot(struct mc_replay *r, uint64_t t_end)
 
 	r->cur = r->nclips - 1;
 	r->last_out = NULL;
-	if (r->autoplay) {
+	if (r->autoplay && r->autoseq && seq_start(r)) {
+		/* камеры подряд уже запущены */
+	} else if (r->autoplay) {
 		start_play(r);
 	} else {
+		r->seq_active = false;
+		r->return_at = 0;
 		r->pos = r->backward ? clip_duration(&r->clips[r->cur]) : 0;
 		r->playing = false;
 		r->hidden = false;
@@ -159,6 +212,17 @@ static void do_snapshot(struct mc_replay *r, uint64_t t_end)
 
 static void end_reached(struct mc_replay *r, int64_t dur, bool backward)
 {
+	if (r->seq_active) {
+		if (seq_next(r)) {
+			r->pos = backward ? dur : 0;
+			r->last_out = NULL;
+			r->need_output = true;
+			set_setting_int(r, S_CAMERA, r->cam + 1);
+			return;
+		}
+		r->seq_active = false;
+	}
+
 	int action = r->end_action;
 	if (dur <= 0 && action == END_LOOP)
 		action = END_HOLD;
@@ -177,6 +241,29 @@ static void end_reached(struct mc_replay *r, int64_t dur, bool backward)
 		break;
 	}
 	r->need_output = true;
+
+	/* повтор доигран: через заданную паузу вернуться на сцену */
+	if (action != END_LOOP && r->return_enabled && r->return_scene && r->return_scene[0])
+		r->return_at = os_gettime_ns() + (uint64_t)r->return_delay_ms * 1000000ULL;
+}
+
+static void return_task(void *param)
+{
+	char *name = param;
+	obs_source_t *scene = obs_get_source_by_name(name);
+	if (scene) {
+		obs_frontend_set_current_scene(scene);
+		obs_source_release(scene);
+	} else {
+		blog(LOG_WARNING, "[multicam-replay] return scene '%s' not found", name);
+	}
+	bfree(name);
+}
+
+/* Переключение сцены делаем в UI-потоке без ожидания, чтобы не блокировать видеопоток. */
+static void queue_return(const char *scene)
+{
+	obs_queue_task(OBS_TASK_UI, return_task, bstrdup(scene), false);
 }
 
 static void set_setting_double(struct mc_replay *r, const char *key, double v)
@@ -223,8 +310,17 @@ static void act_play_pause(struct mc_replay *r, int arg)
 			r->playing = true;
 			r->hidden = false;
 			r->need_output = true;
+			r->return_at = 0;
 		}
 	}
+	pthread_mutex_unlock(&r->mutex);
+}
+
+static void act_seq_play(struct mc_replay *r, int arg)
+{
+	UNUSED_PARAMETER(arg);
+	pthread_mutex_lock(&r->mutex);
+	seq_start(r);
 	pthread_mutex_unlock(&r->mutex);
 }
 
@@ -248,6 +344,7 @@ static void act_reverse(struct mc_replay *r, int arg)
 		r->playing = true;
 		r->hidden = false;
 		r->need_output = true;
+		r->return_at = 0;
 	}
 	pthread_mutex_unlock(&r->mutex);
 }
@@ -259,6 +356,7 @@ static void act_camera(struct mc_replay *r, int cam)
 		r->cam = cam;
 		r->need_output = true;
 		r->last_out = NULL;
+		r->seq_active = false;
 		set_setting_int(r, S_CAMERA, cam + 1);
 	}
 	pthread_mutex_unlock(&r->mutex);
@@ -303,6 +401,8 @@ static void act_step(struct mc_replay *r, int dir)
 			else if (dir < 0 && idx > 0)
 				idx--;
 			r->pos = (int64_t)(c->frames[r->cam][idx]->ts - c->t0);
+			r->seq_active = false;
+			r->return_at = 0;
 			r->playing = false;
 			r->hidden = false;
 			r->need_output = true;
@@ -334,6 +434,8 @@ static void act_hide(struct mc_replay *r, int arg)
 	pthread_mutex_lock(&r->mutex);
 	r->playing = false;
 	r->hidden = true;
+	r->seq_active = false;
+	r->return_at = 0;
 	r->need_output = true;
 	pthread_mutex_unlock(&r->mutex);
 }
@@ -346,6 +448,8 @@ static void act_clear(struct mc_replay *r, int arg)
 		drop_oldest(r);
 	r->cur = 0;
 	r->playing = false;
+	r->seq_active = false;
+	r->return_at = 0;
 	r->pending_at = 0;
 	r->need_output = true;
 	pthread_mutex_unlock(&r->mutex);
@@ -379,6 +483,7 @@ static const struct mc_hk_def hk_defs[] = {
 	{"mc_prev_clip", "HotkeyPrevClip", act_clip_nav, -1},
 	{"mc_next_clip", "HotkeyNextClip", act_clip_nav, 1},
 	{"mc_last_clip", "HotkeyLastClip", act_clip_nav, 2},
+	{"mc_seq_play", "HotkeySeqPlay", act_seq_play, 0},
 	{"mc_hide", "HotkeyHide", act_hide, 0},
 	{"mc_clear", "HotkeyClear", act_clear, 0},
 };
@@ -412,6 +517,15 @@ static void mc_replay_defaults(obs_data_t *s)
 	obs_data_set_default_int(s, S_MAX_CLIPS, 4);
 	obs_data_set_default_int(s, S_MEM_MB, 8192);
 	obs_data_set_default_bool(s, S_AUTOPLAY, true);
+	obs_data_set_default_bool(s, S_AUTOSEQ, false);
+	for (int i = 1; i <= MC_MAX_CAMS; i++) {
+		char key[16];
+		snprintf(key, sizeof(key), "seq_cam%d", i);
+		obs_data_set_default_bool(s, key, true);
+	}
+	obs_data_set_default_bool(s, S_RET_EN, false);
+	obs_data_set_default_string(s, S_RET_SCENE, "");
+	obs_data_set_default_int(s, S_RET_DELAY, 0);
 }
 
 static void mc_replay_update(void *data, obs_data_t *s)
@@ -455,6 +569,18 @@ static void mc_replay_update(void *data, obs_data_t *s)
 	r->max_clips = maxc;
 	r->mem_limit = (size_t)mem * 1024 * 1024;
 	r->autoplay = obs_data_get_bool(s, S_AUTOPLAY);
+	r->autoseq = obs_data_get_bool(s, S_AUTOSEQ);
+	for (int i = 0; i < MC_MAX_CAMS; i++) {
+		char key[16];
+		snprintf(key, sizeof(key), "seq_cam%d", i + 1);
+		r->seq_cam[i] = obs_data_get_bool(s, key);
+	}
+	r->return_enabled = obs_data_get_bool(s, S_RET_EN);
+	bfree(r->return_scene);
+	r->return_scene = bstrdup(obs_data_get_string(s, S_RET_SCENE));
+	r->return_delay_ms = (int)obs_data_get_int(s, S_RET_DELAY);
+	if (r->return_delay_ms < 0)
+		r->return_delay_ms = 0;
 	while ((int)r->nclips > r->max_clips && r->nclips > 1)
 		drop_oldest(r);
 	pthread_mutex_unlock(&r->mutex);
@@ -508,6 +634,7 @@ static void mc_replay_destroy(void *data)
 
 	bfree(r->clips);
 	bfree(r->group);
+	bfree(r->return_scene);
 	pthread_mutex_destroy(&r->mutex);
 	bfree(r);
 }
@@ -522,6 +649,12 @@ static void mc_replay_tick(void *data, float seconds)
 		const uint64_t t = r->pending_at;
 		r->pending_at = 0;
 		do_snapshot(r, t);
+	}
+
+	if (r->return_at && os_gettime_ns() >= r->return_at) {
+		r->return_at = 0;
+		if (r->return_scene && r->return_scene[0])
+			queue_return(r->return_scene);
 	}
 
 	if (!r->nclips) {
@@ -624,6 +757,24 @@ static obs_properties_t *mc_replay_properties(void *data)
 	obs_property_t *mem = obs_properties_add_int(p, S_MEM_MB, T("MemLimit"), 256, 262144, 256);
 	obs_property_int_set_suffix(mem, " MB");
 	obs_properties_add_bool(p, S_AUTOPLAY, T("AutoPlay"));
+	obs_properties_add_bool(p, S_AUTOSEQ, T("AutoSeq"));
+	for (int i = 1; i <= MC_MAX_CAMS; i++) {
+		char key[16], label[64];
+		snprintf(key, sizeof(key), "seq_cam%d", i);
+		snprintf(label, sizeof(label), "%s %d", T("SeqCamN"), i);
+		obs_properties_add_bool(p, key, label);
+	}
+
+	obs_properties_add_bool(p, S_RET_EN, T("ReturnEnabled"));
+	obs_property_t *scene = obs_properties_add_list(p, S_RET_SCENE, T("ReturnScene"), OBS_COMBO_TYPE_LIST,
+							OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(scene, "", "");
+	char **names = obs_frontend_get_scene_names();
+	for (char **n = names; n && *n; n++)
+		obs_property_list_add_string(scene, *n, *n);
+	bfree(names);
+	obs_property_t *rd = obs_properties_add_int(p, S_RET_DELAY, T("ReturnDelay"), 0, 60000, 100);
+	obs_property_int_set_suffix(rd, " ms");
 
 	obs_properties_add_button2(p, "btn_save", T("BtnSave"), btn_save, data);
 	obs_properties_add_button2(p, "btn_play", T("BtnPlayPause"), btn_play, data);
@@ -737,6 +888,20 @@ bool mc_replay_get_status(const char *source_name, struct mc_replay_status *out)
 		out->backward = r->backward;
 		out->hidden = r->hidden;
 		out->post_pending = r->pending_at != 0;
+		out->seq = r->seq_active;
+		out->seq_pos = 0;
+		out->seq_total = 0;
+		if (r->nclips) {
+			const struct mc_clip *c = &r->clips[r->cur];
+			for (int i = 0; i < MC_MAX_CAMS; i++) {
+				if (r->seq_cam[i] && c->count[i]) {
+					out->seq_total++;
+					if (i <= r->cam)
+						out->seq_pos++;
+				}
+			}
+		}
+		out->return_pending = r->return_at != 0;
 		out->pos_sec = r->nclips ? (double)r->pos / 1e9 : 0.0;
 		out->dur_sec = r->nclips ? (double)clip_duration(&r->clips[r->cur]) / 1e9 : 0.0;
 		out->mem_mb = (double)mc_mem_in_use() / (1024.0 * 1024.0);

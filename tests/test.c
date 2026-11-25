@@ -38,10 +38,22 @@ double obs_data_get_double(obs_data_t *d, const char *k) { struct kv *e = find(d
 bool obs_data_get_bool(obs_data_t *d, const char *k) { struct kv *e = find(d, k, false); return e && e->num != 0; }
 void obs_data_set_int(obs_data_t *d, const char *k, long long v) { find(d, k, true)->num = (double)v; }
 void obs_data_set_double(obs_data_t *d, const char *k, double v) { find(d, k, true)->num = v; }
+void obs_data_set_bool(obs_data_t *d, const char *k, bool v) { find(d, k, true)->num = v; }
+void obs_data_set_string(obs_data_t *d, const char *k, const char *v) { snprintf(find(d, k, true)->str, 64, "%s", v); }
 void obs_data_release(obs_data_t *d) { (void)d; }
 
 struct obs_source { obs_data_t *settings; const char *name; };
 const char *obs_source_get_name(const obs_source_t *s) { return s->name; }
+
+/* заглушки возврата на сцену */
+static char g_scene_switched[64];
+static int g_scene_switches;
+char **obs_frontend_get_scene_names(void) { return NULL; }
+obs_source_t *obs_get_source_by_name(const char *n) { return (obs_source_t *)(void *)strdup(n); }
+void obs_source_release(obs_source_t *s) { free(s); }
+void obs_frontend_set_current_scene(obs_source_t *s) { snprintf(g_scene_switched, sizeof(g_scene_switched), "%s", (const char *)(void *)s); g_scene_switches++; }
+void obs_queue_task(enum obs_task_type t, obs_task_t fn, void *p, bool wait) { (void)t; (void)wait; fn(p); }
+size_t obs_property_list_add_string(obs_property_t *p, const char *a, const char *b) { (void)p;(void)a;(void)b; return 0; }
 obs_data_t *obs_source_get_settings(const obs_source_t *s) { return s->settings; }
 
 static struct { bool blank; int cam; uint32_t frameno; long count; } g_out;
@@ -232,6 +244,85 @@ int main(void)
 		CHECK(!mc_replay_trigger("Nope", "mc_save"), "unknown source rejected");
 		CHECK(!mc_replay_get_status("Nope", &st), "status of unknown source fails");
 	}
+	/* --- камеры подряд --- */
+	{
+		struct mc_replay_status st;
+		mc_replay_trigger("Replay", "mc_clear");
+		mc_replay_trigger("Replay", "mc_speed_100");
+		mc_replay_set_speed("Replay", 400.0); /* быстро, чтобы тест был коротким */
+		obs_data_set_int(rsrc.settings, "post_ms", 0);
+		obs_data_set_int(rsrc.settings, "clip_seconds", 2);
+		obs_data_set_bool(rsrc.settings, "seq_cam3", false); /* камера 3 исключена */
+		mc_replay_source_info.update(rep, rsrc.settings);
+		for (uint32_t i = 460; i < 560; i++) { g_now += FRAME_NS; for (int c = 0; c < 4; c++) feed(filt[c], c, i); }
+		mc_replay_trigger("Replay", "mc_reverse"); /* убедимся, что направление не ломает порядок */
+		mc_replay_trigger("Replay", "mc_reverse");
+		mc_replay_trigger("Replay", "mc_save");
+		tick_n(rep, 1, 1.0f / 30);
+		CHECK(mc_replay_trigger("Replay", "mc_seq_play"), "seq play accepted");
+		tick_n(rep, 1, 1.0f / 30);
+		CHECK(mc_replay_get_status("Replay", &st) && st.seq && st.seq_total == 3 && st.seq_pos == 1 && g_out.cam == 0,
+		      "sequence starts on camera 1 (%d of %d)", st.seq_pos, st.seq_total);
+		int order[8], norder = 0, last_cam = -1;
+		for (int i = 0; i < 400 && norder < 8; i++) {
+			tick_n(rep, 1, 1.0f / 30);
+			if (!g_out.blank && g_out.cam != last_cam) { last_cam = g_out.cam; order[norder++] = g_out.cam; }
+			mc_replay_get_status("Replay", &st);
+			if (!st.seq && !st.playing) break;
+		}
+		CHECK(norder == 3 && order[0] == 0 && order[1] == 1 && order[2] == 3, "camera order 1,2,4 (camera 3 excluded): got %d cams", norder);
+		CHECK(!st.seq && !st.playing && st.cam == 4, "sequence finished and holds last camera");
+		obs_data_set_bool(rsrc.settings, "seq_cam3", true);
+		mc_replay_source_info.update(rep, rsrc.settings);
+		mc_replay_trigger("Replay", "mc_seq_play");
+		mc_replay_trigger("Replay", "mc_cam2"); /* ручной выбор камеры отменяет последовательность */
+		CHECK(mc_replay_get_status("Replay", &st) && !st.seq, "manual camera switch cancels the sequence");
+	}
+
+	/* --- возврат на сцену --- */
+	{
+		struct mc_replay_status st;
+		obs_data_set_bool(rsrc.settings, "return_enabled", true);
+		obs_data_set_string(rsrc.settings, "return_scene", "Game");
+		obs_data_set_int(rsrc.settings, "return_delay_ms", 500);
+		mc_replay_source_info.update(rep, rsrc.settings);
+		g_scene_switches = 0; g_scene_switched[0] = 0;
+		mc_replay_trigger("Replay", "mc_restart");
+		for (int i = 0; i < 200; i++) { tick_n(rep, 1, 1.0f / 30); mc_replay_get_status("Replay", &st); if (!st.playing) break; }
+		CHECK(!st.playing && st.return_pending && g_scene_switches == 0, "clip ended: return is scheduled, not yet executed");
+		tick_n(rep, 10, 1.0f / 30); /* 0.33 s < 0.5 s */
+		CHECK(g_scene_switches == 0, "no switch before the delay expires");
+		tick_n(rep, 10, 1.0f / 30);
+		CHECK(g_scene_switches == 1 && !strcmp(g_scene_switched, "Game"), "switched to scene 'Game' (%d switches)", g_scene_switches);
+		tick_n(rep, 30, 1.0f / 30);
+		CHECK(g_scene_switches == 1, "switch happens only once");
+
+		/* возврат после полной последовательности камер, а не после каждой камеры */
+		g_scene_switches = 0;
+		mc_replay_trigger("Replay", "mc_seq_play");
+		int ticks = 0;
+		for (; ticks < 600; ticks++) { tick_n(rep, 1, 1.0f / 30); mc_replay_get_status("Replay", &st); if (!st.playing && !st.seq) break; }
+		CHECK(g_scene_switches == 0 && st.return_pending, "no scene switch between cameras of a sequence");
+		tick_n(rep, 30, 1.0f / 30);
+		CHECK(g_scene_switches == 1, "one switch after the whole sequence");
+
+		/* ручная остановка отменяет возврат */
+		g_scene_switches = 0;
+		mc_replay_trigger("Replay", "mc_restart");
+		for (int i = 0; i < 200; i++) { tick_n(rep, 1, 1.0f / 30); mc_replay_get_status("Replay", &st); if (!st.playing) break; }
+		mc_replay_trigger("Replay", "mc_hide");
+		tick_n(rep, 60, 1.0f / 30);
+		CHECK(g_scene_switches == 0, "Hide cancels the pending return");
+
+		/* пустое имя сцены: ничего не делаем */
+		obs_data_set_string(rsrc.settings, "return_scene", "");
+		mc_replay_source_info.update(rep, rsrc.settings);
+		mc_replay_trigger("Replay", "mc_restart");
+		for (int i = 0; i < 200; i++) { tick_n(rep, 1, 1.0f / 30); mc_replay_get_status("Replay", &st); if (!st.playing) break; }
+		tick_n(rep, 60, 1.0f / 30);
+		CHECK(g_scene_switches == 0, "empty scene name = no return");
+	}
+
 	/* --- очистка, отсутствие утечек --- */
 	press("mc_hide");
 	tick_n(rep, 1, 1.0f / 30);
